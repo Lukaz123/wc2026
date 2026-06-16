@@ -1,0 +1,32 @@
+name: Auto-import WC 2026 results
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (print changes, write nothing)"
+        type: boolean
+        default: true
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run scraper
+        env:
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          FIREBASE_TOKEN:  ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            node scripts/scrape-results.mjs --dry-run
+          else
+            node scripts/scrape-results.mjs
+          fi
