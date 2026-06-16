@@ -1776,13 +1776,13 @@ function renderAdminResults() {
         return;
     }
 
-    const todayStr = new Date().toISOString().slice(0, 10); // "2026-06-XX"
+    const now = new Date();
+    const h24ago = new Date(now - 24 * 60 * 60 * 1000);
 
     const todayFixes = fixes.filter(f => {
         if (!f.date) return false;
         const kickoff = new Date(f.date);
-        const fixtureDay = kickoff.toISOString().slice(0, 10);
-        return fixtureDay === todayStr && getResult(f) == null;
+        return kickoff >= h24ago && kickoff <= now && getResult(f) == null;
     });
 
     const otherFixes = fixes.filter(f => !todayFixes.includes(f));
@@ -1790,7 +1790,7 @@ function renderAdminResults() {
     let html = '';
 
     if (todayFixes.length) {
-        html += `<div class="adm-today-header">🔴 Today's matches</div>`;
+        html += `<div class="adm-today-header">🔴 Recent / today</div>`;
         html += todayFixes.map(f => buildAdminRow(f)).join('');
         html += `<div class="adm-section-divider"></div>`;
     }
