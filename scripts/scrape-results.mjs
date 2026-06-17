@@ -1,122 +1,134 @@
-// ─────────────────────────────────────────────────────────────
-// Auto results scraper for WC 2026 predictions app
-// Source : openfootball/worldcup.json (public domain, no API key)
-// Target : Firebase Realtime DB  fixtures/{id}
-// Runtime: Node 20+ (uses global fetch). No dependencies.
-//
-// What it does, each run:
-//   1. Pull the latest 2026 results feed (final scores only).
-//   2. Pull your current fixtures from Firebase.
-//   3. Match feed games to fixtures by team names (+ date tiebreaker).
-//   4. For any finished game whose fixture has no result yet,
-//      PATCH { homeScore, awayScore, result, locked:true } — same
-//      shape the admin "Set Result" button writes.
-//
-// Idempotent: a fixture that already has the correct score is skipped.
-// ─────────────────────────────────────────────────────────────
+#!/usr/bin/env node
+/**
+ * scrape-results.mjs
+ * Fetches finished WC 2026 scores from TheSportsDB and writes them to Firebase.
+ * TheSportsDB updates within minutes of final whistle — no API key needed.
+ *
+ * Usage:
+ *   node scrape-results.mjs              # live run — writes to Firebase
+ *   node scrape-results.mjs --dry-run    # prints what would change, writes nothing
+ *
+ * Required env vars:
+ *   FIREBASE_DB_URL    e.g. https://svjetsko-prenstvo-2026-default-rtdb.europe-west1.firebasedatabase.app
+ *   FIREBASE_TOKEN     Firebase Database secret (Project Settings → Service Accounts → Database Secrets)
+ */
 
-const DB_URL =
-  process.env.FIREBASE_DB_URL ||
-  "https://svjetsko-prvenstvo-2026-default-rtdb.europe-west1.firebasedatabase.app";
+const FEED_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsseason.php?id=4429&s=2026";
+const DB_URL   = process.env.FIREBASE_DB_URL?.replace(/\/$/, "");
+const TOKEN    = process.env.FIREBASE_TOKEN;
+const DRY_RUN  = process.argv.includes("--dry-run");
 
-const SOURCE =
-  process.env.RESULTS_SOURCE ||
-  "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json";
-
-const DRY_RUN = process.env.DRY_RUN === "1";
-
-// Normalised-name → canonical token. Both the feed's name and your
-// app's name run through canon(); they only need to land on the SAME
-// string. Names that already match after norm() need no entry here.
-const ALIASES = {
-  "czech republic": "czechia",
-  "turkey": "turkiye",
-  "dr congo": "congodr",      "congo dr": "congodr",
-  "iran": "iran",             "ir iran": "iran",
-  "ivory coast": "ivorycoast","cote d ivoire": "ivorycoast",
-  "cape verde": "capeverde",  "cabo verde": "capeverde",
-  "korea republic": "south korea",
-  "united states": "usa",
-};
-
-function norm(name) {
-  return String(name || "")
-    .normalize("NFD").replace(/[̀-ͯ]/g, "") // strip accents
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+if (!DB_URL || !TOKEN) {
+  console.error("Missing FIREBASE_DB_URL or FIREBASE_TOKEN env vars.");
+  process.exit(1);
 }
-const canon = (name) => {
-  const n = norm(name);
-  return ALIASES[n] || n;
+
+// ─── Team name aliases (TheSportsDB name → your Firebase name) ────────────
+const ALIAS = {
+  "Czech Republic":        "Czechia",
+  "Turkey":                "Türkiye",
+  "DR Congo":              "Congo DR",
+  "Iran":                  "IR Iran",
+  "Ivory Coast":           "Côte d'Ivoire",
+  "Cape Verde":            "Cabo Verde",
+  "Bosnia-Herzegovina":    "Bosnia & Herzegovina",
+  "Bosnia and Herzegovina":"Bosnia & Herzegovina",
+  "United States":         "USA",
+  "Korea Republic":        "South Korea",
+  "Curacao":               "Curaçao",
 };
 
-const teamName = (t) => (typeof t === "object" && t ? t.name : t);
-const pairKey  = (home, away) => `${canon(home)}|${canon(away)}`;
+function normalize(name) {
+  return (ALIAS[name] ?? name).toLowerCase().trim();
+}
 
-async function getJSON(url, opts) {
-  const res = await fetch(url, opts);
-  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+// ─── Helpers ──────────────────────────────────────────────────────────────
+async function get(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
   return res.json();
 }
 
-async function main() {
-  // 1. Feed
-  const feed = await getJSON(SOURCE);
-  const feedMatches = feed.matches || feed.rounds?.flatMap((r) => r.matches) || [];
-
-  // 2. Fixtures
-  const fixtures = (await getJSON(`${DB_URL}/fixtures.json`)) || {};
-
-  // Index fixtures by team-pair (group games meet once → unique key)
-  const byPair = {};
-  for (const [id, f] of Object.entries(fixtures)) {
-    byPair[pairKey(f.home, f.away)] = { id, f };
-  }
-
-  let updated = 0, skipped = 0, unmatched = 0;
-
-  for (const m of feedMatches) {
-    const home = teamName(m.team1 ?? m.home);
-    const away = teamName(m.team2 ?? m.away);
-
-    // Final score: score.ft = [h,a]  (fall back to score1/score2)
-    const ft = m.score?.ft;
-    const h = Array.isArray(ft) ? ft[0] : m.score1;
-    const a = Array.isArray(ft) ? ft[1] : m.score2;
-    if (h == null || a == null) continue; // not finished yet
-
-    const hit = byPair[pairKey(home, away)];
-    if (!hit) {
-      unmatched++;
-      console.log(`  ? no fixture for: ${home} vs ${away}`);
-      continue;
-    }
-
-    const { id, f } = hit;
-    // Already has this exact result → nothing to do
-    if (f.homeScore === h && f.awayScore === a && f.result) { skipped++; continue; }
-
-    const result = h > a ? "1" : h === a ? "X" : "2";
-    const body = { homeScore: h, awayScore: a, result, locked: true };
-
-    console.log(`  ✓ ${home} ${h}–${a} ${away}  →  fixtures/${id}`);
-    if (!DRY_RUN) {
-      const res = await fetch(`${DB_URL}/fixtures/${id}.json`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(`PATCH fixtures/${id} → HTTP ${res.status}`);
-    }
-    updated++;
-  }
-
-  console.log(
-    `\nDone. updated=${updated} skipped=${skipped} unmatched=${unmatched}` +
-    (DRY_RUN ? "  (DRY RUN — nothing written)" : "")
-  );
+async function patch(path, data) {
+  const url = `${DB_URL}/${path}.json?auth=${TOKEN}`;
+  const res = await fetch(url, {
+    method:  "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(`PATCH ${path} → ${res.status} ${await res.text()}`);
 }
 
-main().catch((e) => { console.error("FAILED:", e.message); process.exit(1); });
+function getResult(home, away) {
+  if (home > away) return "1";
+  if (home === away) return "X";
+  return "2";
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────
+const [feed, fixturesRaw] = await Promise.all([
+  get(FEED_URL),
+  get(`${DB_URL}/fixtures.json?auth=${TOKEN}`),
+]);
+
+const events   = feed.events || [];
+const fixtures = Object.entries(fixturesRaw || {}).map(([id, f]) => ({ id, ...f }));
+
+let updated = 0, skipped = 0, unmatched = 0;
+
+for (const match of events) {
+  // Only process finished matches
+  if (match.strStatus !== "FT") continue;
+
+  const homeScore = parseInt(match.intHomeScore);
+  const awayScore = parseInt(match.intAwayScore);
+  if (isNaN(homeScore) || isNaN(awayScore)) continue;
+
+  const result = getResult(homeScore, awayScore);
+  const date   = match.dateEvent; // "2026-06-11"
+  const home   = normalize(match.strHomeTeam);
+  const away   = normalize(match.strAwayTeam);
+
+  // Find matching Firebase fixture by date + team names
+  const fix = fixtures.find(f => {
+    if (!f.date) return false;
+    // Firebase dates are stored as full ISO strings — compare just the date part
+    const fixDate = new Date(f.date).toISOString().slice(0, 10);
+    // TheSportsDB dateEvent is local date — also try the day before/after for midnight games
+    const d = new Date(date);
+    const dates = [
+      d.toISOString().slice(0, 10),
+      new Date(d - 86400000).toISOString().slice(0, 10),
+      new Date(d + 86400000).toISOString().slice(0, 10),
+    ];
+    return dates.includes(fixDate) &&
+           normalize(f.home) === home &&
+           normalize(f.away) === away;
+  });
+
+  if (!fix) {
+    console.warn(`UNMATCHED: ${match.strHomeTeam} vs ${match.strAwayTeam} on ${date}`);
+    unmatched++;
+    continue;
+  }
+
+  // Already has correct result — skip
+  if (fix.homeScore === homeScore && fix.awayScore === awayScore && fix.result === result) {
+    skipped++;
+    continue;
+  }
+
+  const payload = { homeScore, awayScore, result, locked: true };
+
+  if (DRY_RUN) {
+    console.log(`DRY RUN — would update ${fix.id}: ${fix.home} ${homeScore}–${awayScore} ${fix.away} (${result})`);
+    updated++;
+  } else {
+    await patch(`fixtures/${fix.id}`, payload);
+    console.log(`Updated ${fix.id}: ${fix.home} ${homeScore}–${awayScore} ${fix.away}`);
+    updated++;
+  }
+}
+
+const suffix = DRY_RUN ? "  (DRY RUN — nothing written)" : "";
+console.log(`\nDone. updated=${updated} skipped=${skipped} unmatched=${unmatched}${suffix}`);
